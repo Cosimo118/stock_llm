@@ -2,6 +2,7 @@
 AKShare adapter for Chinese A-share market data.
 """
 from datetime import datetime
+from enum import Enum
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import akshare as ak
@@ -11,6 +12,13 @@ from .base_adapter import MarketDataAdapter
 from ..models import MarketData, StockInfo
 from ...utils.logger import log
 from ...config.settings import DATA_SOURCE_CONFIG
+
+
+class Period(Enum):
+    """Data period types."""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
 
 
 class AKShareAdapter(MarketDataAdapter):
@@ -104,24 +112,26 @@ class AKShareAdapter(MarketDataAdapter):
         except Exception as e:
             self._handle_error(e, f"Failed to get stock info for {symbol}")
     
-    async def get_daily_data(
+    async def get_historical_data(
         self,
         symbol: str,
         start_date: datetime,
         end_date: datetime,
+        period: Period = Period.DAILY,
         adjust_type: Optional[str] = 'qfq'
     ) -> pd.DataFrame:
-        """Get daily historical data for an A-share stock.
+        """Get historical data for an A-share stock.
         
         Args:
             symbol: Stock symbol (e.g., '000001.SZ')
             start_date: Start date
             end_date: End date
+            period: Data period type (daily/weekly/monthly)
             adjust_type: Price adjustment type ('qfq' for forward adjustment,
                         'hfq' for backward adjustment, None for no adjustment)
             
         Returns:
-            DataFrame with daily data
+            DataFrame with historical data
         """
         try:
             self._validate_symbol(symbol)
@@ -133,11 +143,11 @@ class AKShareAdapter(MarketDataAdapter):
             
             # 获取历史数据
             print(f"\n[DEBUG] 开始获取数据...")
-            print(f"参数: symbol={code}, period=daily, start_date={start_date.strftime('%Y%m%d')}, end_date={end_date.strftime('%Y%m%d')}, adjust={adjust_type}")
+            print(f"参数: symbol={code}, period={period.value}, start_date={start_date.strftime('%Y%m%d')}, end_date={end_date.strftime('%Y%m%d')}, adjust={adjust_type}")
             
             df = ak.stock_zh_a_hist(
                 symbol=code,
-                period="daily",
+                period=period.value,
                 start_date=start_date.strftime('%Y%m%d'),
                 end_date=end_date.strftime('%Y%m%d'),
                 adjust=adjust_type
@@ -173,7 +183,27 @@ class AKShareAdapter(MarketDataAdapter):
             return df
             
         except Exception as e:
-            self._handle_error(e, f"Failed to get daily data for {symbol}")
+            self._handle_error(e, f"Failed to get {period.value} data for {symbol}")
+    
+    # 为了保持向后兼容性，保留get_daily_data方法
+    async def get_daily_data(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        adjust_type: Optional[str] = 'qfq'
+    ) -> pd.DataFrame:
+        """Get daily historical data for an A-share stock.
+        
+        This is a convenience method that calls get_historical_data with period=Period.DAILY
+        """
+        return await self.get_historical_data(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            period=Period.DAILY,
+            adjust_type=adjust_type
+        )
     
     async def get_real_time_quotes(self, symbols: List[str]) -> Dict[str, MarketData]:
         """Get real-time quotes for multiple A-share stocks.
@@ -202,38 +232,49 @@ class AKShareAdapter(MarketDataAdapter):
                 
                 result[symbol] = MarketData(
                     symbol=symbol,
-                    market=self.market,
                     timestamp=datetime.now(),
                     open=float(stock_data['开盘']),
                     high=float(stock_data['最高']),
                     low=float(stock_data['最低']),
                     close=float(stock_data['最新价']),
-                    volume=int(stock_data['成交量']),
+                    volume=float(stock_data['成交量']),
                     amount=float(stock_data['成交额'])
                 )
-            
-            print("\n[DEBUG] 实时行情获取成功")
-            print("\n[DEBUG] 实时行情:")
-            for symbol, data in result.items():
-                print(f"{symbol}: {data}")
             
             return result
             
         except Exception as e:
-            self._handle_error(e, f"Failed to get real-time quotes for {symbols}")
-    
-    def _get_exchange_suffix(self, code: str) -> str:
-        """Get exchange suffix based on stock code.
-        
-        Args:
-            code: Stock code
+            self._handle_error(e, "Failed to get real-time quotes")
             
-        Returns:
-            Exchange suffix ('SH' or 'SZ')
-        """
+    def _get_exchange_suffix(self, code: str) -> str:
+        """Get exchange suffix for a stock code."""
         if code.startswith(('600', '601', '603', '605', '688')):
-            return 'SH'
+            return 'SH'  # 上海证券交易所
         elif code.startswith(('000', '001', '002', '003', '300', '301')):
-            return 'SZ'
+            return 'SZ'  # 深圳证券交易所
         else:
+            raise ValueError(f"Unknown exchange for stock code: {code}")
+            
+    def _validate_symbol(self, symbol: str) -> None:
+        """Validate stock symbol format."""
+        if not isinstance(symbol, str):
+            raise ValueError("Symbol must be a string")
+            
+        parts = symbol.split('.')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid symbol format: {symbol}")
+            
+        code, market = parts
+        if not code.isdigit() or len(code) != 6:
             raise ValueError(f"Invalid stock code: {code}")
+            
+        if market not in ['SH', 'SZ']:
+            raise ValueError(f"Invalid market suffix: {market}")
+            
+    def _validate_date_range(self, start_date: datetime, end_date: datetime) -> None:
+        """Validate date range."""
+        if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
+            raise ValueError("Start date and end date must be datetime objects")
+            
+        if start_date > end_date:
+            raise ValueError("Start date must be earlier than end date")
