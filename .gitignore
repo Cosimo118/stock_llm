@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -32,9 +31,9 @@ ENV/
 *.swo
 
 # Project specific
-data/
-logs/
-cache/
+/data/
+/logs/
+/cache/
 .env
 
 # Test
