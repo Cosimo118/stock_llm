@@ -4,6 +4,7 @@ AKShare adapter for Chinese A-share market data.
 from datetime import datetime
 from enum import Enum
 from typing import List, Dict, Any, Optional
+import asyncio
 import pandas as pd
 import akshare as ak
 from functools import lru_cache
@@ -152,10 +153,6 @@ class AKShareAdapter(MarketDataAdapter):
                 end_date=end_date.strftime('%Y%m%d'),
                 adjust=adjust_type
             )
-            print("\n[DEBUG] 原始数据:")
-            print(df)
-            print("\n[DEBUG] 数据列名:")
-            print(df.columns.tolist())
             
             # 检查数据是否为空
             if df.empty:
@@ -164,9 +161,6 @@ class AKShareAdapter(MarketDataAdapter):
                 
             # 重命名列
             df = df.rename(columns=self.COLUMN_MAP)
-            
-            print("\n[DEBUG] 重命名后的列名:")
-            print(df.columns.tolist())
             
             # 转换日期列
             df['date'] = pd.to_datetime(df['date'])
@@ -177,13 +171,85 @@ class AKShareAdapter(MarketDataAdapter):
             # 按日期排序
             df = df.sort_values('date')
             
-            print("\n[DEBUG] 处理后的数据:")
-            print(df[['open', 'high', 'low', 'close', 'volume', 'amount']].head())
+            # 添加股票代码列
+            df['symbol'] = symbol
             
             return df
             
         except Exception as e:
             self._handle_error(e, f"Failed to get {period.value} data for {symbol}")
+    
+    async def get_batch_historical_data(
+        self,
+        symbols: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        period: Period = Period.DAILY,
+        adjust_type: Optional[str] = 'qfq',
+        max_workers: int = 5
+    ) -> pd.DataFrame:
+        """Get historical data for multiple A-share stocks in parallel.
+        
+        Args:
+            symbols: List of stock symbols
+            start_date: Start date
+            end_date: End date
+            period: Data period type (daily/weekly/monthly)
+            adjust_type: Price adjustment type
+            max_workers: Maximum number of concurrent requests
+            
+        Returns:
+            DataFrame with historical data for all stocks
+        """
+        try:
+            for symbol in symbols:
+                self._validate_symbol(symbol)
+            self._validate_date_range(start_date, end_date)
+            
+            print(f"\n[DEBUG] 开始批量获取{len(symbols)}只股票的{period.value}数据")
+            print(f"股票列表: {symbols}")
+            
+            # 使用信号量限制并发数
+            semaphore = asyncio.Semaphore(max_workers)
+            
+            async def get_data_with_semaphore(symbol: str) -> pd.DataFrame:
+                async with semaphore:
+                    return await self.get_historical_data(
+                        symbol=symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        period=period,
+                        adjust_type=adjust_type
+                    )
+            
+            # 并发获取数据
+            tasks = [get_data_with_semaphore(symbol) for symbol in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 处理结果
+            successful_dfs = []
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    print(f"\n[WARNING] 获取{symbol}数据失败: {str(result)}")
+                    continue
+                successful_dfs.append(result)
+            
+            if not successful_dfs:
+                raise ValueError("No data retrieved for any symbol")
+            
+            # 合并所有数据
+            df_combined = pd.concat(successful_dfs, axis=0, ignore_index=True)
+            
+            # 按股票代码和日期排序
+            df_combined = df_combined.sort_values(['symbol', 'date'])
+            
+            print(f"\n[DEBUG] 成功获取{len(successful_dfs)}/{len(symbols)}只股票的数据")
+            print(f"数据行数: {len(df_combined)}")
+            
+            return df_combined
+            
+        except Exception as e:
+            self._handle_error(e, "Failed to get batch historical data")
     
     # 为了保持向后兼容性，保留get_daily_data方法
     async def get_daily_data(
