@@ -8,12 +8,16 @@ import asyncio
 import pandas as pd
 import akshare as ak
 from functools import lru_cache
+from ..cache.cache_manager import CacheManager
+import re
+import logging
 
 from .base_adapter import MarketDataAdapter
 from ..models import MarketData, StockInfo
 from ...utils.logger import log
 from ...config.settings import DATA_SOURCE_CONFIG
 
+logger = logging.getLogger(__name__)
 
 class Period(Enum):
     """Data period types."""
@@ -44,6 +48,7 @@ class AKShareAdapter(MarketDataAdapter):
         """Initialize the AKShare adapter."""
         super().__init__(market='CN')
         self.config = DATA_SOURCE_CONFIG['akshare']
+        self.cache = CacheManager()
         
     @lru_cache(maxsize=1)
     async def get_stock_list(self) -> List[StockInfo]:
@@ -65,10 +70,10 @@ class AKShareAdapter(MarketDataAdapter):
                 )
                 stocks.append(stock_info)
             
-            print(f"\n[DEBUG] 股票列表获取成功，共{len(stocks)}只股票")
-            print("\n[DEBUG] 股票列表:")
+            log.debug(f"\n[DEBUG] 股票列表获取成功，共{len(stocks)}只股票")
+            log.debug("\n[DEBUG] 股票列表:")
             for stock in stocks:
-                print(stock.symbol)
+                log.debug(stock.symbol)
             
             return stocks
             
@@ -88,7 +93,7 @@ class AKShareAdapter(MarketDataAdapter):
             self._validate_symbol(symbol)
             
             # 移除市场后缀
-            code = symbol.split('.')[0]
+            code = self._format_symbol(symbol)
             
             # 获取股票详细信息
             df = ak.stock_individual_info_em(code)
@@ -96,10 +101,10 @@ class AKShareAdapter(MarketDataAdapter):
             # 转换为字典
             info_dict = df.set_index('item').to_dict()['value']
             
-            print(f"\n[DEBUG] 股票{symbol}详细信息获取成功")
-            print("\n[DEBUG] 股票详细信息:")
+            log.debug(f"\n[DEBUG] 股票{symbol}详细信息获取成功")
+            log.debug("\n[DEBUG] 股票详细信息:")
             for key, value in info_dict.items():
-                print(f"{key}: {value}")
+                log.debug(f"{key}: {value}")
             
             return StockInfo(
                 symbol=symbol,
@@ -116,148 +121,161 @@ class AKShareAdapter(MarketDataAdapter):
     async def get_historical_data(
         self,
         symbol: str,
-        start_date: datetime,
-        end_date: datetime,
-        period: Period = Period.DAILY,
-        adjust_type: Optional[str] = 'qfq'
+        period: Period,
+        start_date: str,
+        end_date: str,
+        adjust_type: str = 'qfq'
     ) -> pd.DataFrame:
-        """Get historical data for an A-share stock.
+        """获取历史K线数据
         
         Args:
-            symbol: Stock symbol (e.g., '000001.SZ')
-            start_date: Start date
-            end_date: End date
-            period: Data period type (daily/weekly/monthly)
-            adjust_type: Price adjustment type ('qfq' for forward adjustment,
-                        'hfq' for backward adjustment, None for no adjustment)
+            symbol: 股票代码
+            period: 数据周期
+            start_date: 开始日期 (YYYYMMDD)
+            end_date: 结束日期 (YYYYMMDD)
+            adjust_type: 复权类型, 默认前复权
             
         Returns:
-            DataFrame with historical data
+            DataFrame包含历史数据
         """
         try:
+            # 尝试从缓存获取数据
+            cached_data = self.cache.get_data(
+                symbol, period.value, start_date, end_date
+            )
+            if cached_data is not None:
+                return cached_data
+
             self._validate_symbol(symbol)
-            self._validate_date_range(start_date, end_date)
             
-            # 移除市场后缀
-            code = symbol.split('.')[0]
-            print(f"\n[DEBUG] 处理后的股票代码: {code}")
-            
-            # 获取历史数据
-            print(f"\n[DEBUG] 开始获取数据...")
-            print(f"参数: symbol={code}, period={period.value}, start_date={start_date.strftime('%Y%m%d')}, end_date={end_date.strftime('%Y%m%d')}, adjust={adjust_type}")
+            log.debug(f"开始获取数据...")
+            log.debug(f"参数: symbol={symbol}, period={period.value}, "
+                      f"start_date={start_date}, end_date={end_date}, adjust={adjust_type}")
             
             df = ak.stock_zh_a_hist(
-                symbol=code,
+                symbol=self._format_symbol(symbol),
                 period=period.value,
-                start_date=start_date.strftime('%Y%m%d'),
-                end_date=end_date.strftime('%Y%m%d'),
+                start_date=start_date,
+                end_date=end_date,
                 adjust=adjust_type
             )
             
-            # 检查数据是否为空
             if df.empty:
-                print("\n[DEBUG] 获取到的数据为空!")
-                raise ValueError(f"No data returned for symbol {symbol}")
+                raise ValueError(f"获取数据为空: {symbol}")
                 
-            # 重命名列
+            # 标准化数据格式
             df = df.rename(columns=self.COLUMN_MAP)
-            
-            # 转换日期列
-            df['date'] = pd.to_datetime(df['date'])
-            
-            # 只保留需要的列
+            df['date'] = pd.to_datetime(df['date']).apply(lambda x: x.strftime('%Y%m%d'))
             df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-            
-            # 按日期排序
             df = df.sort_values('date')
-            
-            # 添加股票代码列
             df['symbol'] = symbol
+            
+            # 保存到缓存
+            self.cache.save_data(
+                symbol, period.value, start_date, end_date, df
+            )
             
             return df
             
         except Exception as e:
-            self._handle_error(e, f"Failed to get {period.value} data for {symbol}")
-    
+            log.error(f"获取历史数据出错: {str(e)}")
+            raise
+
     async def get_batch_historical_data(
         self,
         symbols: List[str],
-        start_date: datetime,
-        end_date: datetime,
-        period: Period = Period.DAILY,
-        adjust_type: Optional[str] = 'qfq',
+        period: Period,
+        start_date: str,
+        end_date: str,
         max_workers: int = 5
     ) -> pd.DataFrame:
-        """Get historical data for multiple A-share stocks in parallel.
+        """批量获取多只股票的历史数据
         
         Args:
-            symbols: List of stock symbols
-            start_date: Start date
-            end_date: End date
-            period: Data period type (daily/weekly/monthly)
-            adjust_type: Price adjustment type
-            max_workers: Maximum number of concurrent requests
+            symbols: 股票代码列表
+            period: 数据周期
+            start_date: 开始日期 (YYYYMMDD)
+            end_date: 结束日期 (YYYYMMDD)
+            max_workers: 最大并发数
             
         Returns:
-            DataFrame with historical data for all stocks
+            包含所有股票数据的DataFrame
         """
         try:
-            for symbol in symbols:
-                self._validate_symbol(symbol)
-            self._validate_date_range(start_date, end_date)
+            log.debug(f"开始批量获取{len(symbols)}只股票的{period.value}数据")
+            log.debug(f"股票列表: {symbols}")
             
-            print(f"\n[DEBUG] 开始批量获取{len(symbols)}只股票的{period.value}数据")
-            print(f"股票列表: {symbols}")
+            # 先从缓存获取数据
+            missed_symbols, cached_data = self.cache.get_batch_data(
+                symbols, period.value, start_date, end_date
+            )
             
-            # 使用信号量限制并发数
+            if not missed_symbols:
+                log.debug("所有数据均命中缓存")
+                return pd.concat(cached_data, ignore_index=True)
+                
+            # 获取未缓存的数据
+            log.debug(f"从API获取{len(missed_symbols)}只股票的数据")
             semaphore = asyncio.Semaphore(max_workers)
+            tasks = []
             
-            async def get_data_with_semaphore(symbol: str) -> pd.DataFrame:
-                async with semaphore:
-                    return await self.get_historical_data(
-                        symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date,
-                        period=period,
-                        adjust_type=adjust_type
-                    )
+            for symbol in missed_symbols:
+                task = self._get_single_stock_data(
+                    symbol=symbol,
+                    period=period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    semaphore=semaphore
+                )
+                tasks.append(task)
+                
+            new_data = await asyncio.gather(*tasks)
             
-            # 并发获取数据
-            tasks = [get_data_with_semaphore(symbol) for symbol in symbols]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 处理结果
-            successful_dfs = []
-            for symbol, result in zip(symbols, results):
-                if isinstance(result, Exception):
-                    print(f"\n[WARNING] 获取{symbol}数据失败: {str(result)}")
-                    continue
-                successful_dfs.append(result)
-            
-            if not successful_dfs:
-                raise ValueError("No data retrieved for any symbol")
+            # 保存新数据到缓存
+            self.cache.save_batch_data(
+                missed_symbols, period.value,
+                start_date, end_date, new_data
+            )
             
             # 合并所有数据
-            df_combined = pd.concat(successful_dfs, axis=0, ignore_index=True)
+            all_data = cached_data + new_data
+            result = pd.concat(all_data, ignore_index=True)
             
-            # 按股票代码和日期排序
-            df_combined = df_combined.sort_values(['symbol', 'date'])
+            log.debug(f"成功获取{len(symbols)}/{len(symbols)}只股票的数据")
+            log.debug(f"数据行数: {len(result)}")
             
-            print(f"\n[DEBUG] 成功获取{len(successful_dfs)}/{len(symbols)}只股票的数据")
-            print(f"数据行数: {len(df_combined)}")
-            
-            return df_combined
+            return result
             
         except Exception as e:
-            self._handle_error(e, "Failed to get batch historical data")
+            log.error(f"批量获取数据出错: {str(e)}")
+            raise
+
+    async def _get_single_stock_data(
+        self,
+        symbol: str,
+        period: Period,
+        start_date: str,
+        end_date: str,
+        semaphore: asyncio.Semaphore,
+        adjust_type: str = 'qfq'
+    ) -> pd.DataFrame:
+        """获取单只股票数据(内部方法)"""
+        async with semaphore:
+            return await self.get_historical_data(
+                symbol=symbol,
+                period=period,
+                start_date=start_date,
+                end_date=end_date,
+                adjust_type=adjust_type
+            )
     
     # 为了保持向后兼容性，保留get_daily_data方法
     async def get_daily_data(
         self,
         symbol: str,
-        start_date: datetime,
-        end_date: datetime,
-        adjust_type: Optional[str] = 'qfq'
+        start_date: str,
+        end_date: str,
+        adjust_type: str = 'qfq'
     ) -> pd.DataFrame:
         """Get daily historical data for an A-share stock.
         
@@ -265,9 +283,9 @@ class AKShareAdapter(MarketDataAdapter):
         """
         return await self.get_historical_data(
             symbol=symbol,
+            period=Period.DAILY,
             start_date=start_date,
             end_date=end_date,
-            period=Period.DAILY,
             adjust_type=adjust_type
         )
     
@@ -321,26 +339,28 @@ class AKShareAdapter(MarketDataAdapter):
         else:
             raise ValueError(f"Unknown exchange for stock code: {code}")
             
+    def _format_symbol(self, symbol: str) -> str:
+        """格式化股票代码（移除市场后缀）
+        
+        Args:
+            symbol: 带市场后缀的股票代码 (e.g., '000001.SZ')
+            
+        Returns:
+            不带后缀的股票代码 (e.g., '000001')
+        """
+        return symbol.split('.')[0]
+        
     def _validate_symbol(self, symbol: str) -> None:
-        """Validate stock symbol format."""
+        """验证股票代码格式
+        
+        Args:
+            symbol: 股票代码
+            
+        Raises:
+            ValueError: 股票代码格式无效
+        """
         if not isinstance(symbol, str):
-            raise ValueError("Symbol must be a string")
+            raise ValueError(f"股票代码必须是字符串类型: {symbol}")
             
-        parts = symbol.split('.')
-        if len(parts) != 2:
-            raise ValueError(f"Invalid symbol format: {symbol}")
-            
-        code, market = parts
-        if not code.isdigit() or len(code) != 6:
-            raise ValueError(f"Invalid stock code: {code}")
-            
-        if market not in ['SH', 'SZ']:
-            raise ValueError(f"Invalid market suffix: {market}")
-            
-    def _validate_date_range(self, start_date: datetime, end_date: datetime) -> None:
-        """Validate date range."""
-        if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
-            raise ValueError("Start date and end date must be datetime objects")
-            
-        if start_date > end_date:
-            raise ValueError("Start date must be earlier than end date")
+        if not re.match(r'^\d{6}\.(SH|SZ)$', symbol):
+            raise ValueError(f"股票代码格式无效: {symbol}")
